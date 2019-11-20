@@ -1,0 +1,657 @@
+#!/bin/bash
+VERSION=3.5
+
+ssm_help() {
+    echo \
+"Shadowsocks Server Manager $VERSION
+Usage: `basename $0` <action> [<args>]
+
+Available actions:
+  new <configs>
+  del <configs>
+  ls [<configs>]
+  ll [<configs>]
+  uri [<configs>]
+  address
+  address <ip or domain>
+  refresh
+  rename <config_before> <config_after>
+  settings
+  backup
+  restore <backup file>
+  help
+  version
+  update
+"
+}
+
+__error() {
+    local ret
+    case $1 in
+    action_not_found )
+        echo "Error: Action '$2' not found. Use -h for help."
+        ret=20 ;;
+    miss_requirements )
+        echo "Error: Program '$2' not found."
+        ret=21 ;;
+    miss_argument )
+        echo "Error: Miss argument(s). Use -h for help."
+        ret=22 ;;
+    file_not_found )
+        echo "Error: file '$2' not found."
+        ret=23 ;;
+    file_conflict )
+        echo "Error: file '$2' already exists."
+        ret=24 ;;
+    no_permission )
+        echo "Error: No permission!"
+        ret=25 ;;
+    unsupported_os )
+        echo "Error: this OS is not supported"
+        ret=27 ;;
+    install_failed )
+        echo "Error: Install failed."
+        ret=28 ;;
+    can_not_cd )
+        echo "Error: can not enter directory '$2'"
+        ret=29 ;;
+    * )
+        echo "Error: Unknown error."
+        ret=60 ;;
+    esac >&2
+    exit $ret
+}
+
+__banner() {
+    local color_none='\e[0m'
+    local color_yellow='\e[1;33m'
+    echo -e "${color_yellow}# ${1}${color_none}"
+}
+
+__pre_sudo() {
+    if ! sudo -v; then
+        __error no_permission
+    fi
+}
+
+__get_ip4() {
+    local iface4=`ip route show | grep default | sed -e 's/^default.*dev \([^ ]\+\).*$/\1/'`
+    local ip4=`ip addr show dev $iface4 | grep -m 1 'inet\ ' | sed -e 's/^.*inet \([^ \\]\+\)\/.*$/\1/'`
+    if ! echo "$ip4" | egrep "^(192|172|10)\." >/dev/null; then
+        echo $ip4
+    fi
+}
+
+# example:
+#   __confirm "question?"
+__confirm() {
+    unset REPLY
+    while [[ $REPLY != [yn] ]]; do
+        echo -n "$1 (y/n) "
+        read
+    done
+    if [[ $REPLY == 'y' ]]; then
+        return 0
+    elif [[ $REPLY == 'n' ]]; then
+        return 1
+    fi
+}
+
+# example:
+#   __firewall add $port
+#   __firewall del $port
+__firewall() {
+    case $FIREWALL_TYPE in
+    firewalld | firewall-cmd )
+        case $1 in
+        add )
+            __banner "Add port $2 to firewalld"
+            sudo firewall-cmd --add-port=$2/tcp --add-port=$2/udp
+            sudo firewall-cmd --permanent --add-port=$2/tcp --add-port=$2/udp
+            ;;
+        del )
+            __banner "Remove port $2 from firewalld"
+            sudo firewall-cmd --remove-port=$2/tcp --remove-port=$2/udp
+            sudo firewall-cmd --permanent --remove-port=$2/tcp --remove-port=$2/udp
+            ;;
+        esac
+        ;;
+    esac
+}
+
+# example:
+#   __service add $config_name
+#   __service del $config_name
+__service() {
+    case $1 in
+    add )
+        __banner "Enable and start systemd service"
+        sudo systemctl enable --now shadowsocks-libev-server@$2
+        ;;
+    del )
+        __banner "Stop and disable systemd service"
+        sudo systemctl disable --now shadowsocks-libev-server@$2
+        ;;
+    esac
+}
+
+# example:
+#   __usedports add $port
+#   __usedports del $port
+#   __usedports has $port
+__usedports() {
+    case $1 in
+    add )
+        __banner "Add used port $2"
+        echo $2 | sudo tee -a ssm_usedports >/dev/null
+        ;;
+    del )
+        __banner "Delete used port $2"
+        sudo sed "/^$2$/d" -i ssm_usedports
+        ;;
+    has )
+        grep "^$2$" ssm_usedports &>/dev/null
+        ;;
+    esac
+}
+
+# example:
+#   __set_config enable $config_name
+#   __set_config disable $config_name
+__set_config() {
+    local direction
+    case $1 in
+    enable )
+        direction='add' ;;
+    disable )
+        direction='del' ;;
+    esac
+
+    __service $direction $2
+
+    local config_file="$2.json"
+    local port=`jq -r '.server_port' $config_file`
+    __usedports $direction $port
+    __firewall $direction $port
+}
+
+# ssm_settings example:
+#   server_address=example.com
+#   firewall_type=none
+__save_settings() {
+    {
+        echo "server_address=$SERVER_ADDRESS"
+        echo "firewall_type=$FIREWALL_TYPE"
+    } | sudo tee ssm_settings >/dev/null
+}
+
+__has() {
+    type "$1" >/dev/null 2>&1
+}
+
+# example:
+#   __httpget <uri>
+__httpget() {
+    if __has curl; then
+        curl "$1" 2>/dev/null
+    elif __has wget; then
+        wget -qO- "$1"
+    else
+        __error miss_requirements "curl' or 'wget"
+    fi
+}
+
+__randpw() {
+    tr -dc _A-Z-a-z-0-9 < /dev/urandom | head -c ${1:-16}; echo
+}
+
+# example:
+#   __install $prog
+__install() {
+    __banner "Install $1"
+    if __has yum; then
+        sudo yum install "$1" -y
+    elif __has apt-get; then
+        if [[ -z "$APT_UPDATED" ]]; then
+            sudo apt-get update
+            APT_UPDATED=1
+        fi
+        sudo apt-get install "$1" -y
+    elif __has pacman; then
+        sudo pacman --noconfirm -Sy "$1"
+    else
+        __error unsupported_os
+    fi
+
+    if [[ $? != 0 ]]; then
+        __error install_failed
+    fi
+}
+
+# example:
+#   __raw_uri $config_name
+__raw_uri() {
+    local config_file="$1.json"
+
+    local method=`jq -r ".method" "$config_file"`
+    local password=`jq -r ".password" "$config_file"`
+    local address=`ssm_address`
+    local port=`jq -r ".server_port" "$config_file"`
+
+    local raw_info="$method:$password@$address:$port"
+    echo ss://`printf $raw_info | base64 -w 0 | sed 's/=//g'`
+}
+
+# example:
+#   __detail $config_name
+__detail() {
+    echo "$1:"
+    cat "$1.json" | egrep "(server_port|password|timeout|method)" --color=never | sed 's/[,"]//g'
+    echo "  uri: `__raw_uri $1`"
+}
+
+# example: add one attribute A=B to file F
+#   __addattr F A B
+__sudo_addattr() {
+    sudo sed "/^ *${2}[ =]/d" -i "$1"
+    echo "$2 = $3" | sudo tee -a "$1" >/dev/null
+}
+
+# example:
+#   __sudo_addline file line
+# NOTICE: no root permission when reading files
+__sudo_addline() {
+    local esc_quote=`echo "$2" | sed 's/\*/\\\*/g'`
+    if ! ( [[ -f "$1" ]] && egrep "^ *${esc_quote} *$" "$1" >/dev/null ); then
+        echo "$2" | sudo tee -a "$1" >/dev/null
+    fi
+}
+
+__install_ss() {
+    __pre_sudo
+
+    # add repo if needed
+    source /etc/os-release
+    case $ID in
+    fedora )
+        if [[ "$VERSION_ID" -ge 26 ]]; then
+            __banner "Enable copr librehat/shadowsocks"
+            sudo dnf copr enable librehat/shadowsocks -y
+        fi
+        ;;
+    centos )
+        if [[ "$VERSION_ID" -ge 6 ]]; then
+            __banner "Download yum repo librehat-shadowsocks"
+            sudo wget -P /etc/yum.repos.d "https://copr.fedorainfracloud.org/coprs/librehat/shadowsocks/repo/epel-${VERSION_ID}/librehat-shadowsocks-epel-${VERSION_ID}.repo"
+        fi
+        ;;
+    ubuntu )
+        if [[ `echo $VERSION_ID | sed 's/\.//g'` -ge 1404 && `echo $VERSION_ID | sed 's/\.//g'` -le 1604 ]]; then
+            __banner "Enable PPA max-c-lv/shadowsocks-libev"
+            if [[ -z "$APT_UPDATED" ]]; then
+                sudo apt-get update
+                APT_UPDATED=1
+            fi
+            sudo apt-get install software-properties-common -y
+            sudo add-apt-repository ppa:max-c-lv/shadowsocks-libev -y
+            sudo apt-get update
+        fi
+        ;;
+    debian )
+        if [[ $VERSION_ID == 9 ]]; then
+            __banner "Add Debian 9 backports repository"
+            __sudo_addline /etc/apt/sources.list "deb http://ftp.debian.org/debian stretch-backports main"
+            sudo apt-get update
+            apt-get -t stretch-backports install shadowsocks-libev
+        fi
+        ;;
+    esac
+
+    __install shadowsocks-libev
+
+    # temporary fix link error on fedora 29
+    if [[ $ID == fedora && $VERSION_ID == 29 ]]; then
+        __banner "Fix error on Fedora 29"
+        sudo ln -s /lib64/libmbedcrypto.so.2.13.0 /lib64/libmbedcrypto.so.2
+    fi
+
+    __banner "Change service file to enable udp reply and tcp fast open"
+    sudo cp /lib/systemd/system/shadowsocks-libev-server@.service /etc/systemd/system/
+    sudo sed -E 's/^ExecStart=([^ ]*).*/ExecStart=\1 -u --fast-open -c \/etc\/shadowsocks-libev\/%i\.json/g' -i /etc/systemd/system/shadowsocks-libev-server@.service
+    sudo systemctl daemon-reload
+
+    __banner "Optimize the shadowsocks server on Linux"
+    __sudo_addline /etc/security/limits.conf "* soft nofile 51200"
+    __sudo_addline /etc/security/limits.conf "* hard nofile 51200"
+    __sudo_addattr /etc/sysctl.conf fs.file-max                     51200
+    __sudo_addattr /etc/sysctl.conf net.core.rmem_max               67108864
+    __sudo_addattr /etc/sysctl.conf net.core.wmem_max               67108864
+    __sudo_addattr /etc/sysctl.conf net.core.netdev_max_backlog     250000
+    __sudo_addattr /etc/sysctl.conf net.core.somaxconn              4096
+    __sudo_addattr /etc/sysctl.conf net.ipv4.tcp_syncookies         1
+    __sudo_addattr /etc/sysctl.conf net.ipv4.tcp_tw_reuse           1
+    __sudo_addattr /etc/sysctl.conf net.ipv4.tcp_fin_timeout        30
+    __sudo_addattr /etc/sysctl.conf net.ipv4.tcp_keepalive_time     1200
+    __sudo_addattr /etc/sysctl.conf net.ipv4.ip_local_port_range    "10000 65000"
+    __sudo_addattr /etc/sysctl.conf net.ipv4.tcp_max_syn_backlog    8192
+    __sudo_addattr /etc/sysctl.conf net.ipv4.tcp_max_tw_buckets     5000
+    __sudo_addattr /etc/sysctl.conf net.ipv4.tcp_fastopen           3
+    __sudo_addattr /etc/sysctl.conf net.ipv4.tcp_mem                "25600 51200 102400"
+    __sudo_addattr /etc/sysctl.conf net.ipv4.tcp_rmem               "4096 87380 67108864"
+    __sudo_addattr /etc/sysctl.conf net.ipv4.tcp_wmem               "4096 65536 67108864"
+    __sudo_addattr /etc/sysctl.conf net.ipv4.tcp_mtu_probing        1
+    __sudo_addattr /etc/sysctl.conf net.ipv4.tcp_congestion_control hybla
+    sudo sysctl -p
+
+    __banner "Enable server tcp bbr congestion control"
+    if ! sudo modprobe tcp_bbr; then
+        echo "Failed to enable tcp_bbr, skip."
+    else
+        __sudo_addline /etc/modules-load.d/modules.conf tcp_bbr
+        __sudo_addattr /etc/sysctl.conf net.ipv4.tcp_congestion_control bbr
+        __sudo_addattr /etc/sysctl.conf net.core.default_qdisc          fq
+        sudo sysctl -p
+    fi
+
+    __banner "Installation done"
+}
+
+__init() {
+    if ! __has ss-server; then
+        if __confirm "Program shadowsocks-libev seems not installed. Do you want to install it?"; then
+            __install_ss
+        else
+            __error miss_requirements shadowsocks-libev
+        fi
+    fi
+
+    STARTPATH=`pwd`
+    WORKPATH="/etc/shadowsocks-libev"
+    if [[ ! -d $WORKPATH ]]; then
+        __pre_sudo
+        sudo mkdir $WORKPATH
+    fi
+    if ! cd $WORKPATH; then
+        __error can_not_cd /etc/shadowsocks-libev
+    fi
+
+    if ! __has jq; then
+        if __confirm "Program jq not installed. Do you want to install it?"; then
+            __pre_sudo
+            __install jq
+        else
+            __error miss_requirements jq
+        fi
+    fi
+
+    if [[ ! -f ssm_settings ]]; then
+        # simple assume that only centos and fedora use firewall
+        if __has firewall-cmd; then
+            FIREWALL_TYPE=firewalld
+        else
+            FIREWALL_TYPE=none
+        fi
+        __banner "Create settings file"
+        __pre_sudo
+        __save_settings
+    fi
+    source ssm_settings
+    # backward compatibility
+    SERVER_ADDRESS=$server_address
+    FIREWALL_TYPE=$firewall_type
+
+    if [[ ! -f ssm_usedports ]]; then
+        __banner "Create usedports file"
+        __pre_sudo
+        sudo touch ssm_usedports
+    fi
+
+    if [[ -f config.json ]] && ! __usedports has `jq -r '.server_port' config.json`; then
+        __banner "Remove default config.json"
+        __pre_sudo
+        sudo rm config.json
+    fi
+}
+
+ssm_new() {
+    if [[ -z "$@" ]]; then
+        __error miss_argument
+    fi
+    __pre_sudo
+
+    for config_name in "$@"; do
+        local config_file="$config_name.json"
+        if [[ -f $config_file ]]; then
+            __error file_conflict "$config_name"
+        fi
+
+        __banner "Create config file"
+        while true; do
+            local port=$(($RANDOM + 2000))
+            if ! __usedports has $port; then break; fi
+        done
+        printf '{"server":["[::]","0.0.0.0"],"server_port":%s,"password":"%s","timeout":60,"method":"chacha20-ietf-poly1305"}\n' "$port" "$(__randpw)" | jq . | sudo tee "$config_file"
+
+        __set_config enable "$config_name"
+
+        __banner "Done, uri is:"
+        ssm_uri "$config_name"
+        echo
+    done
+}
+
+ssm_del() {
+    if [[ -z "$@" ]]; then
+        __error miss_argument
+    fi
+    __pre_sudo
+
+    for config_name in "$@"; do
+        local config_file="$config_name.json"
+        if [[ ! -f $config_file ]]; then
+            __error file_not_found "$config_name"
+        fi
+
+        __set_config disable "$config_name"
+
+        __banner "Remove config file"
+        sudo rm "$config_file"
+        echo
+    done
+}
+
+ssm_uri() {
+    if [[ -z "$@" ]]; then
+        for config_name in `ssm_ls`; do
+            printf "%-8s `__raw_uri $config_name`\n" "$config_name"
+        done
+    else
+        for config_name in "$@"; do
+            if [[ -f "$config_name.json" ]]; then
+                printf "%-8s `__raw_uri $config_name`\n" "$config_name"
+            else
+                echo "ssm uri: no config $config_name." >&2
+            fi
+        done
+    fi
+}
+
+# backward compatibility
+ssm_url() {
+    echo "warning: this action has been deprecated, use \`uri\` instead." >&2
+    ssm_uri "$@"
+}
+
+ssm_ls() {
+    if [[ -z "$@" ]]; then
+        ls | grep ".json$" | xargs -i basename -a -s .json {}
+    else
+        for config_name in "$@"; do
+            if [[ -f "$config_name.json" ]]; then
+                echo $config_name
+            else
+                echo "ssm ls: no config $config_name." >&2
+            fi
+        done
+    fi
+}
+
+ssm_ll() {
+    if [[ -z "$@" ]]; then
+        for config_name in `ssm_ls`; do
+            __detail $config_name
+            echo
+        done | less
+    else
+        for config_name in "$@"; do
+            if [[ -f "$config_name.json" ]]; then
+                __detail $config_name
+                echo
+            else
+                echo "ssm ll: no config $config_name." >&2
+                echo
+            fi
+        done
+    fi
+}
+
+ssm_address() {
+    echo $SERVER_ADDRESS
+}
+
+ssm_refresh() {
+    __pre_sudo
+
+    __banner "Stop and disable all shadowsocks services"
+    for ss_service in `systemctl list-units "shadowsocks-libev-server@*" --all | grep "shadowsocks-libev-server@" | sed 's/● //g' | awk '{print $1}'`; do
+        sudo systemctl stop $ss_service
+        sudo systemctl disable $ss_service
+    done
+
+    for port in `cat ssm_usedports`; do
+        __firewall del "$port"
+    done
+    __banner "Clear used ports"
+    sudo rm ssm_usedports
+    sudo touch ssm_usedports
+
+    for config_name in `ssm_ls`; do
+        __set_config enable "$config_name"
+    done
+}
+
+ssm_rename() {
+    if [[ -z "$1" || -z "$2" ]]; then
+        __error miss_argument
+    fi
+    local config_file="$1.json"
+
+    if [[ ! -f "$config_file" ]]; then
+        __error file_not_found "$1"
+    fi
+    local new_config_file="$2.json"
+
+    if [[ -f "$new_config_file" ]]; then
+        __error file_conflict "$2"
+    fi
+
+    __pre_sudo
+    __set_config disable "$1"
+    __banner "Rename config file"
+    sudo mv "$config_file" "$new_config_file"
+
+    __set_config enable "$2"
+}
+
+ssm_settings() {
+    __pre_sudo
+    sudoedit ssm_settings
+}
+
+ssm_backup() {
+    local backup_file=`realpath ~/ssm_bak.tgz`
+    if [[ -f "$backup_file" ]] && ! __confirm "'$backup_file' already exists, overwrite?"; then
+        __error file_conflict "$backup_file"
+    fi
+    tar -czf "$backup_file" *.json && echo "Done. Backup to $backup_file."
+}
+
+ssm_restore() {
+    __pre_sudo
+    cd $STARTPATH
+    if [[ -f "$1" ]]; then
+        local realfile=`realpath "$1"`
+        cd $WORKPATH
+        sudo tar -xf "$realfile" && ssm_refresh
+    else
+        __error file_not_found "$1"
+    fi
+}
+
+# exit after update
+ssm_update() {
+    local update_address='https://raw.githubusercontent.com/df543/Shadowsocks-server-script/master/ssm'
+    local temp=`mktemp`
+    if __httpget $update_address > $temp && [[ `bash "$temp" -v` != $VERSION ]]; then
+        mv $temp "$0" && chmod +x "$0" && echo "Replaced '$0'." && exit
+    else
+        echo "No update."
+        rm $temp
+        exit
+    fi
+}
+
+ssm_version() {
+    echo $VERSION
+}
+
+main() {
+    case $1 in
+    'help' | '-h' | '-help' | '--help' | '' )
+        ssm_help
+        exit
+        ;;
+    'update' | '-u' | '-update' | '--update' )
+        ssm_update
+        ;;
+    'version' | '-v' | '-version' | '--version' )
+        ssm_version
+        exit
+        ;;
+    * )
+        if ! __has "ssm_$1"; then
+            __error action_not_found "$1"
+        fi
+        ;;
+    esac
+
+    __init
+
+    if [[ "$1" == 'address' && -n "$2" ]]; then
+        __pre_sudo
+        SERVER_ADDRESS="$2"
+        __banner "Set server address as '$SERVER_ADDRESS'"
+        __save_settings
+        exit
+    elif [[ -z "$SERVER_ADDRESS" ]]; then
+        local ip4=`__get_ip4`
+        if [[ $ip4 ]] && __confirm "Set server address as '$ip4'?"; then
+            REPLY="$ip4"
+        else
+            unset REPLY
+            while [[ -z "$REPLY" ]]; do
+                echo -n "Server address not set. Enter server address: "
+                read -a REPLY
+            done
+        fi
+        __pre_sudo
+        SERVER_ADDRESS="$REPLY"
+        __save_settings
+    fi
+
+    local cmd="ssm_$1"
+    shift
+    $cmd "$@"
+}
+
+main "$@"
